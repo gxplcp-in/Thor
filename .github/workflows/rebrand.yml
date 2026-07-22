@@ -478,6 +478,24 @@ jobs:
           open(home_activity, 'w', encoding='utf-8').write(content)
 
           # ---------------------------------------------------------------
+          # STEP H2: Rename Room Database Schema Folders (NEW FIX)
+          # ---------------------------------------------------------------
+          if old_namespace and old_namespace != NEW_PACKAGE:
+              log("Scanning for Room schema folders...")
+              for r, dirs, files in os.walk("."):
+                  if "schemas" in dirs:
+                      schemas_dir = os.path.join(r, "schemas")
+                      # Bottom-up scan to avoid breaking paths while renaming
+                      for schema_root, schema_dirs, schema_files in os.walk(schemas_dir, topdown=False):
+                          for d in schema_dirs:
+                              if old_namespace in d:
+                                  old_path = os.path.join(schema_root, d)
+                                  new_name = d.replace(old_namespace, NEW_PACKAGE)
+                                  new_path = os.path.join(schema_root, new_name)
+                                  os.rename(old_path, new_path)
+                                  log(f"Renamed Room Schema Folder: {old_path} -> {new_path}")
+
+          # ---------------------------------------------------------------
           # STEP I: final leftover-reference scan. If ANY file anywhere in
           # the repo still contains the old namespace after every step
           # above, fail loudly here with exact file:line - rather than let
