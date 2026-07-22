@@ -64,86 +64,132 @@ jobs:
                   yield r, dirs, files
 
           # ---------------------------------------------------------------
-          # STEP A: find every java/kotlin source root (src/<variant>/java|kotlin)
+          # STEP A: detect the OLD namespace directly from build.gradle(.kts)
+          # or the manifest, BEFORE anything is modified. This is the same
+          # detection that correctly found the app id last time, so we trust
+          # it and use it as the single source of truth for the move below -
+          # no more "walk down and guess the folder shape" heuristics.
+          # ---------------------------------------------------------------
+          def detect_old_namespace():
+              for pattern in ('**/app/build.gradle.kts', '**/app/build.gradle'):
+                  for fp in glob.glob(os.path.join(REPO, pattern), recursive=True):
+                      try:
+                          text = open(fp, encoding='utf-8').read()
+                      except Exception:
+                          continue
+                      m = re.search(r'namespace\s*=?\s*"([\w.]+)"', text)
+                      if m:
+                          return m.group(1), fp, 'namespace'
+              for pattern in ('**/app/build.gradle.kts', '**/app/build.gradle'):
+                  for fp in glob.glob(os.path.join(REPO, pattern), recursive=True):
+                      try:
+                          text = open(fp, encoding='utf-8').read()
+                      except Exception:
+                          continue
+                      m = re.search(r'applicationId\s*=?\s*"([\w.]+)"', text)
+                      if m:
+                          return m.group(1), fp, 'applicationId'
+              for r, dirs, files in walk(REPO):
+                  if 'AndroidManifest.xml' in files:
+                      fp = os.path.join(r, 'AndroidManifest.xml')
+                      text = open(fp, encoding='utf-8').read()
+                      m = re.search(r'package="([\w.]+)"', text)
+                      if m:
+                          return m.group(1), fp, 'manifest package attr'
+              return None, None, None
+
+          old_namespace, detected_from, detected_via = detect_old_namespace()
+          if not old_namespace:
+              log("ERROR: could not detect the existing package/namespace from "
+                  "build.gradle(.kts) or AndroidManifest.xml.")
+              sys.exit(1)
+          log(f"Detected old namespace: '{old_namespace}' (from {detected_from}, via {detected_via})")
+
+          if old_namespace == NEW_PACKAGE:
+              log("Old namespace already matches the target package - nothing to move.")
+
+          old_path = old_namespace.replace('.', os.sep)
+
+          # ---------------------------------------------------------------
+          # STEP B: find every java/kotlin source root, and for each one
+          # that contains root/<old_path>, move that EXACT directory to
+          # root/<new_path>. Deterministic - no guessing involved.
           # ---------------------------------------------------------------
           def find_source_roots():
               roots = []
               for r, dirs, files in walk(REPO):
                   base = os.path.basename(r)
-                  parent = os.path.basename(os.path.dirname(r))
                   grandparent = os.path.basename(os.path.dirname(os.path.dirname(r)))
                   if base in ('java', 'kotlin') and grandparent == 'src':
                       roots.append(r)
               return roots
 
-          def find_base_package_dir(root):
-              """Walk down single-child chains until we hit the folder that
-              actually contains .kt/.java source files. THAT folder's path
-              (relative to root) is the real base package on disk."""
-              cur = root
-              while True:
-                  try:
-                      entries = [e for e in os.listdir(cur) if e not in SKIP_DIRS]
-                  except FileNotFoundError:
-                      return None
-                  subdirs = [e for e in entries if os.path.isdir(os.path.join(cur, e))]
-                  code_files = [e for e in entries if e.endswith(('.kt', '.java'))]
-                  if code_files or len(subdirs) != 1:
-                      return cur if (code_files or subdirs) else None
-                  cur = os.path.join(cur, subdirs[0])
-
           source_roots = find_source_roots()
           if not source_roots:
               log("ERROR: no src/*/java or src/*/kotlin directories found.")
               sys.exit(1)
-
           log(f"Found {len(source_roots)} source root(s): {source_roots}")
 
-          # ---------------------------------------------------------------
-          # STEP B: move each root's base-package directory to NEW_PATH
-          # ---------------------------------------------------------------
           moved_count = 0
-          for root in source_roots:
-              base_dir = find_base_package_dir(root)
-              if not base_dir:
-                  continue
-              rel = os.path.relpath(base_dir, root)
-              if rel == '.':
-                  continue
-              old_namespace_guess = rel.replace(os.sep, '.')
-              new_dir = os.path.join(root, NEW_PATH)
-              if os.path.abspath(base_dir) == os.path.abspath(new_dir):
-                  log(f"  {root}: already at target package, skipping move")
-                  continue
-              os.makedirs(os.path.dirname(new_dir), exist_ok=True)
-              if os.path.exists(new_dir):
-                  for item in os.listdir(base_dir):
-                      dest = os.path.join(new_dir, item)
-                      if os.path.exists(dest):
-                          shutil.rmtree(dest) if os.path.isdir(dest) else os.remove(dest)
-                      shutil.move(os.path.join(base_dir, item), dest)
-                  shutil.rmtree(base_dir, ignore_errors=True)
-              else:
-                  shutil.move(base_dir, new_dir)
-              log(f"  moved (was '{old_namespace_guess}'): {base_dir} -> {new_dir}")
-              moved_count += 1
+          if old_namespace != NEW_PACKAGE:
+              for root in source_roots:
+                  old_dir = os.path.join(root, old_path)
+                  new_dir = os.path.join(root, NEW_PATH)
 
-              # clean up now-empty leftover parent chain
-              parent = os.path.dirname(base_dir)
-              while parent != os.path.abspath(root) and parent.startswith(root):
+                  if not os.path.isdir(old_dir):
+                      log(f"  {root}: no '{old_path}' subfolder here, skipping")
+                      continue
+
+                  log(f"  found old package folder: {old_dir}")
+                  os.makedirs(os.path.dirname(new_dir), exist_ok=True)
+
                   try:
-                      if not os.listdir(parent):
-                          os.rmdir(parent)
-                          parent = os.path.dirname(parent)
+                      if os.path.exists(new_dir):
+                          for item in os.listdir(old_dir):
+                              src_item = os.path.join(old_dir, item)
+                              dest_item = os.path.join(new_dir, item)
+                              if os.path.exists(dest_item):
+                                  if os.path.isdir(dest_item):
+                                      shutil.rmtree(dest_item)
+                                  else:
+                                      os.remove(dest_item)
+                              shutil.move(src_item, dest_item)
+                          shutil.rmtree(old_dir, ignore_errors=True)
                       else:
-                          break
-                  except Exception:
-                      break
+                          shutil.move(old_dir, new_dir)
+                  except Exception as e:
+                      log(f"ERROR: failed to move {old_dir} -> {new_dir}: {e}")
+                      sys.exit(1)
 
-          if moved_count == 0:
-              log("WARNING: no source directories were moved. Either the project "
-                  "already uses the target package, or the layout is non-standard "
-                  "(check the log above).")
+                  if not os.path.isdir(new_dir):
+                      log(f"ERROR: move reported success but {new_dir} does not exist.")
+                      sys.exit(1)
+
+                  log(f"  MOVED: {old_dir} -> {new_dir}")
+                  moved_count += 1
+
+                  # remove now-empty leftover parent chain (old top-level package dirs)
+                  parent = os.path.dirname(old_dir)
+                  root_abs = os.path.abspath(root)
+                  while os.path.abspath(parent) != root_abs and os.path.abspath(parent).startswith(root_abs):
+                      try:
+                          if not os.listdir(parent):
+                              empty_dir = parent
+                              parent = os.path.dirname(parent)
+                              os.rmdir(empty_dir)
+                          else:
+                              break
+                      except Exception:
+                          break
+
+          if old_namespace != NEW_PACKAGE and moved_count == 0:
+              log(f"ERROR: old package folder '{old_path}' was not found under any "
+                  f"of {source_roots}. Directory tree for debugging:")
+              for root in source_roots:
+                  for r, dirs, files in walk(root):
+                      depth = r[len(root):].count(os.sep)
+                      log(f"    {'  ' * depth}{os.path.relpath(r, root)}/")
+              sys.exit(1)
 
           # ---------------------------------------------------------------
           # STEP C: rewrite every .kt/.java file's package line to match
@@ -176,42 +222,9 @@ jobs:
           log(f"Corrected package declarations in {fixed_pkg_count} file(s).")
 
           # ---------------------------------------------------------------
-          # STEP D: global textual cleanup - fix imports/refs to the OLD
-          # namespace anywhere they appear (gradle, manifest, xml, kt, java).
-          # We detect the old namespace fresh from build.gradle/.kts, since
-          # that's independent of the (now already-fixed) folder structure.
+          # STEP D: global textual cleanup - fix any remaining references to
+          # the OLD namespace anywhere (imports, gradle, manifest, xml, etc.)
           # ---------------------------------------------------------------
-          def detect_old_namespace():
-              for pattern in ('**/build.gradle.kts', '**/build.gradle'):
-                  for fp in glob.glob(os.path.join(REPO, pattern), recursive=True):
-                      try:
-                          text = open(fp, encoding='utf-8').read()
-                      except Exception:
-                          continue
-                      m = re.search(r'namespace\s*=?\s*"([\w.]+)"', text)
-                      if m:
-                          return m.group(1)
-              for pattern in ('**/build.gradle.kts', '**/build.gradle'):
-                  for fp in glob.glob(os.path.join(REPO, pattern), recursive=True):
-                      try:
-                          text = open(fp, encoding='utf-8').read()
-                      except Exception:
-                          continue
-                      m = re.search(r'applicationId\s*=?\s*"([\w.]+)"', text)
-                      if m:
-                          return m.group(1)
-              for r, dirs, files in walk(REPO):
-                  if 'AndroidManifest.xml' in files:
-                      fp = os.path.join(r, 'AndroidManifest.xml')
-                      text = open(fp, encoding='utf-8').read()
-                      m = re.search(r'package="([\w.]+)"', text)
-                      if m:
-                          return m.group(1)
-              return None
-
-          old_namespace = detect_old_namespace()
-          log(f"Detected old namespace for text cleanup: {old_namespace}")
-
           TEXT_EXT = ('.kt', '.java', '.xml', '.gradle', '.kts', '.pro', '.properties', '.cfg')
           if old_namespace and old_namespace != NEW_PACKAGE:
               replaced_count = 0
