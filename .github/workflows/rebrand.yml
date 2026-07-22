@@ -240,11 +240,23 @@ jobs:
 
           # ---------------------------------------------------------------
           # STEP D: global textual cleanup - fix any remaining references to
-          # the OLD namespace anywhere (imports, gradle, manifest, xml, etc.)
+          # the OLD namespace ANYWHERE in the repo: imports, gradle files,
+          # AndroidManifest.xml (including a fully-qualified Hilt
+          # @HiltAndroidApp Application class name, e.g.
+          # android:name="com.valhalla.thor.MyApp"), Room/Hilt annotation
+          # arguments (e.g. room.schemaLocation paths in build.gradle),
+          # and any other .kt/.java file in the repo regardless of which
+          # module it lives in - not just the moved directory.
+          #
+          # Boundary-safe: replaces "com.valhalla.thor" but will NOT touch
+          # an unrelated sibling package like "com.valhalla.thorlib" that
+          # merely starts with the same characters.
           # ---------------------------------------------------------------
           TEXT_EXT = ('.kt', '.java', '.xml', '.gradle', '.kts', '.pro', '.properties', '.cfg')
           if old_namespace and old_namespace != NEW_PACKAGE:
+              old_ns_pattern = re.compile(re.escape(old_namespace) + r'(?![A-Za-z0-9_])')
               replaced_count = 0
+              touched_files = []
               for r, dirs, files in walk(REPO):
                   for f in files:
                       if f.endswith(TEXT_EXT):
@@ -253,10 +265,36 @@ jobs:
                               text = open(fp, encoding='utf-8').read()
                           except Exception:
                               continue
-                          if old_namespace in text:
-                              open(fp, 'w', encoding='utf-8').write(text.replace(old_namespace, NEW_PACKAGE))
+                          new_text, n = old_ns_pattern.subn(NEW_PACKAGE, text)
+                          if n:
+                              open(fp, 'w', encoding='utf-8').write(new_text)
                               replaced_count += 1
-              log(f"Replaced remaining '{old_namespace}' references in {replaced_count} file(s).")
+                              touched_files.append((fp, n))
+              log(f"Replaced remaining '{old_namespace}' references in {replaced_count} file(s):")
+              for fp, n in touched_files:
+                  log(f"    {fp}  ({n} occurrence(s))")
+
+          # ---------------------------------------------------------------
+          # STEP D2: explicitly confirm the Application class referenced by
+          # AndroidManifest.xml's <application android:name=...> now points
+          # at the new package (covers Hilt's @HiltAndroidApp Application
+          # subclass, which is commonly declared fully-qualified there).
+          # ---------------------------------------------------------------
+          for r, dirs, files in walk(REPO):
+              if 'AndroidManifest.xml' in files:
+                  fp = os.path.join(r, 'AndroidManifest.xml')
+                  text = open(fp, encoding='utf-8').read()
+                  m = re.search(r'<application[^>]*\sandroid:name="([^"]+)"', text)
+                  if m:
+                      app_name_attr = m.group(1)
+                      if app_name_attr.startswith('.'):
+                          log(f"  {fp}: <application> android:name=\"{app_name_attr}\" is relative - "
+                              f"resolves against namespace, already correct.")
+                      elif old_namespace and old_namespace in app_name_attr:
+                          log(f"  WARNING: {fp}: <application> android:name=\"{app_name_attr}\" "
+                              f"still references the old namespace after cleanup - check manually.")
+                      else:
+                          log(f"  {fp}: <application> android:name=\"{app_name_attr}\" looks correct.")
 
           # ---------------------------------------------------------------
           # STEP E: force namespace / applicationId in build.gradle(.kts),
@@ -438,6 +476,41 @@ jobs:
                   sys.exit(1)
 
           open(home_activity, 'w', encoding='utf-8').write(content)
+
+          # ---------------------------------------------------------------
+          # STEP I: final leftover-reference scan. If ANY file anywhere in
+          # the repo still contains the old namespace after every step
+          # above, fail loudly here with exact file:line - rather than let
+          # a stray import/annotation-argument reach KSP and produce an
+          # opaque PROCESSING_ERROR three build steps later. This is the
+          # single most useful diagnostic for Room/Hilt-related failures,
+          # since KSP resolves types strictly and any leftover reference to
+          # the old package is a near-certain cause.
+          # ---------------------------------------------------------------
+          if old_namespace and old_namespace != NEW_PACKAGE:
+              leftover_pattern = re.compile(re.escape(old_namespace) + r'(?![A-Za-z0-9_])')
+              leftovers = []
+              for r, dirs, files in walk(REPO):
+                  for f in files:
+                      if f.endswith(TEXT_EXT):
+                          fp = os.path.join(r, f)
+                          try:
+                              lines = open(fp, encoding='utf-8').read().split('\n')
+                          except Exception:
+                              continue
+                          for i, line in enumerate(lines, start=1):
+                              if leftover_pattern.search(line):
+                                  leftovers.append((fp, i, line.strip()))
+
+              if leftovers:
+                  log(f"ERROR: found {len(leftovers)} leftover reference(s) to "
+                      f"'{old_namespace}' after the rebrand - this is very likely "
+                      f"what will break KSP/Room/Hilt or the build. Fix these and re-run:")
+                  for fp, i, line in leftovers:
+                      log(f"    {fp}:{i}: {line}")
+                  sys.exit(1)
+              else:
+                  log(f"Verified: no remaining references to '{old_namespace}' anywhere in the repo.")
 
           log("Rebrand + AdMob injection complete.")
           PYEOF
