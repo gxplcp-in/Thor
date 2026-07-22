@@ -131,6 +131,10 @@ jobs:
           log(f"Found {len(source_roots)} source root(s): {source_roots}")
 
           moved_count = 0
+          moved_dirs = []  # (source_root, new_dir) pairs that were actually moved -
+                            # STEP C below touches ONLY these, never unrelated
+                            # modules (e.g. vm-runtime's sun.misc / dalvik.system
+                            # stub files) that happen to share the repo.
           if old_namespace != NEW_PACKAGE:
               for root in source_roots:
                   old_dir = os.path.join(root, old_path)
@@ -167,6 +171,7 @@ jobs:
 
                   log(f"  MOVED: {old_dir} -> {new_dir}")
                   moved_count += 1
+                  moved_dirs.append((root, new_dir))
 
                   # remove now-empty leftover parent chain (old top-level package dirs)
                   parent = os.path.dirname(old_dir)
@@ -192,34 +197,46 @@ jobs:
               sys.exit(1)
 
           # ---------------------------------------------------------------
-          # STEP C: rewrite every .kt/.java file's package line to match
-          # its REAL location on disk (source of truth = filesystem, not text).
+          # STEP C: rewrite the package line of files INSIDE THE MOVED
+          # DIRECTORY ONLY, to match their real location on disk. This is
+          # deliberately scoped to moved_dirs (not every source root in the
+          # repo) so other modules - e.g. a vm-runtime module shipping
+          # sun.misc.Unsafe / dalvik.system.VMRuntime stub files - are never
+          # touched, since their package never matched old_namespace to
+          # begin with and rewriting them would corrupt legitimate stubs.
+          #
+          # Also: Java REQUIRES a trailing semicolon after "package x.y;" -
+          # Kotlin does not. Stripping it (as a previous version of this
+          # script did) breaks javac with "';' expected". We preserve it
+          # here based on file extension.
           # ---------------------------------------------------------------
           fixed_pkg_count = 0
-          for root in source_roots:
-              for r, dirs, files in walk(root):
+          for root, new_dir in moved_dirs:
+              for r, dirs, files in walk(new_dir):
                   for f in files:
                       if not f.endswith(('.kt', '.java')):
                           continue
                       fp = os.path.join(r, f)
                       rel_dir = os.path.relpath(r, root)
                       correct_pkg = NEW_PACKAGE if rel_dir == '.' else rel_dir.replace(os.sep, '.')
+                      semi = ';' if fp.endswith('.java') else ''
                       try:
                           text = open(fp, encoding='utf-8').read()
                       except Exception as e:
                           log(f"  WARNING: could not read {fp}: {e}")
                           continue
                       new_text, n = re.subn(
-                          r'^\s*package\s+[\w.]+\s*$',
-                          f'package {correct_pkg}',
+                          r'^\s*package\s+[\w.]+\s*;?\s*$',
+                          f'package {correct_pkg}{semi}',
                           text, count=1, flags=re.MULTILINE
                       )
                       if n == 0:
-                          new_text = f'package {correct_pkg}\n\n' + text
+                          new_text = f'package {correct_pkg}{semi}\n\n' + text
                       if new_text != text:
                           open(fp, 'w', encoding='utf-8').write(new_text)
                           fixed_pkg_count += 1
-          log(f"Corrected package declarations in {fixed_pkg_count} file(s).")
+          log(f"Corrected package declarations in {fixed_pkg_count} file(s) "
+              f"(scoped to moved directories only).")
 
           # ---------------------------------------------------------------
           # STEP D: global textual cleanup - fix any remaining references to
