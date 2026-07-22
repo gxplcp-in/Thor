@@ -34,125 +34,279 @@ jobs:
         with:
           python-version: '3.11'
 
-      # ---------------------------------------------------------------
-      # STEP 1: Rename package everywhere + move source folder structure
-      # ---------------------------------------------------------------
-      - name: Rename package and move source folders
+      # ---------------------------------------------------------------------
+      # ONE atomic script does the whole rebrand + AdMob injection.
+      # It treats each source file's REAL folder location as the source of
+      # truth for its package (never trusts text-matching alone), so the
+      # class Gradle compiles always matches where it physically lives.
+      # ---------------------------------------------------------------------
+      - name: Rebrand package, app name, and inject AdMob
         run: |
-          cat > /tmp/rename_package.py << 'PYEOF'
-          import os, re, shutil, glob, sys
+          cat > /tmp/rebrand.py << 'PYEOF'
+          import os, re, shutil, sys, glob
 
+          REPO = os.getcwd()
           NEW_PACKAGE = os.environ["NEW_PACKAGE"]
-          repo_root = os.getcwd()
-          SKIP_DIRS = {'.git', 'build', '.gradle', '.idea'}
+          NEW_PATH = NEW_PACKAGE.replace('.', os.sep)
+          NEW_APP_NAME = os.environ["NEW_APP_NAME"]
+          ADMOB_APP_ID = os.environ["ADMOB_APP_ID"]
+          BANNER_ID = os.environ["ADMOB_BANNER_ID"]
+          INTERSTITIAL_ID = os.environ["ADMOB_INTERSTITIAL_ID"]
+          ADS_VERSION = "23.6.0"
+          SKIP_DIRS = {'.git', 'build', '.gradle', '.idea', 'node_modules'}
+
+          def log(msg):
+              print(f"[rebrand] {msg}", flush=True)
 
           def walk(root):
               for r, dirs, files in os.walk(root):
                   dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
                   yield r, dirs, files
 
-          def find_old_package():
-              # 1) Try AndroidManifest.xml package attribute
-              for r, dirs, files in walk(repo_root):
+          # ---------------------------------------------------------------
+          # STEP A: find every java/kotlin source root (src/<variant>/java|kotlin)
+          # ---------------------------------------------------------------
+          def find_source_roots():
+              roots = []
+              for r, dirs, files in walk(REPO):
+                  base = os.path.basename(r)
+                  parent = os.path.basename(os.path.dirname(r))
+                  grandparent = os.path.basename(os.path.dirname(os.path.dirname(r)))
+                  if base in ('java', 'kotlin') and grandparent == 'src':
+                      roots.append(r)
+              return roots
+
+          def find_base_package_dir(root):
+              """Walk down single-child chains until we hit the folder that
+              actually contains .kt/.java source files. THAT folder's path
+              (relative to root) is the real base package on disk."""
+              cur = root
+              while True:
+                  try:
+                      entries = [e for e in os.listdir(cur) if e not in SKIP_DIRS]
+                  except FileNotFoundError:
+                      return None
+                  subdirs = [e for e in entries if os.path.isdir(os.path.join(cur, e))]
+                  code_files = [e for e in entries if e.endswith(('.kt', '.java'))]
+                  if code_files or len(subdirs) != 1:
+                      return cur if (code_files or subdirs) else None
+                  cur = os.path.join(cur, subdirs[0])
+
+          source_roots = find_source_roots()
+          if not source_roots:
+              log("ERROR: no src/*/java or src/*/kotlin directories found.")
+              sys.exit(1)
+
+          log(f"Found {len(source_roots)} source root(s): {source_roots}")
+
+          # ---------------------------------------------------------------
+          # STEP B: move each root's base-package directory to NEW_PATH
+          # ---------------------------------------------------------------
+          moved_count = 0
+          for root in source_roots:
+              base_dir = find_base_package_dir(root)
+              if not base_dir:
+                  continue
+              rel = os.path.relpath(base_dir, root)
+              if rel == '.':
+                  continue
+              old_namespace_guess = rel.replace(os.sep, '.')
+              new_dir = os.path.join(root, NEW_PATH)
+              if os.path.abspath(base_dir) == os.path.abspath(new_dir):
+                  log(f"  {root}: already at target package, skipping move")
+                  continue
+              os.makedirs(os.path.dirname(new_dir), exist_ok=True)
+              if os.path.exists(new_dir):
+                  for item in os.listdir(base_dir):
+                      dest = os.path.join(new_dir, item)
+                      if os.path.exists(dest):
+                          shutil.rmtree(dest) if os.path.isdir(dest) else os.remove(dest)
+                      shutil.move(os.path.join(base_dir, item), dest)
+                  shutil.rmtree(base_dir, ignore_errors=True)
+              else:
+                  shutil.move(base_dir, new_dir)
+              log(f"  moved (was '{old_namespace_guess}'): {base_dir} -> {new_dir}")
+              moved_count += 1
+
+              # clean up now-empty leftover parent chain
+              parent = os.path.dirname(base_dir)
+              while parent != os.path.abspath(root) and parent.startswith(root):
+                  try:
+                      if not os.listdir(parent):
+                          os.rmdir(parent)
+                          parent = os.path.dirname(parent)
+                      else:
+                          break
+                  except Exception:
+                      break
+
+          if moved_count == 0:
+              log("WARNING: no source directories were moved. Either the project "
+                  "already uses the target package, or the layout is non-standard "
+                  "(check the log above).")
+
+          # ---------------------------------------------------------------
+          # STEP C: rewrite every .kt/.java file's package line to match
+          # its REAL location on disk (source of truth = filesystem, not text).
+          # ---------------------------------------------------------------
+          fixed_pkg_count = 0
+          for root in source_roots:
+              for r, dirs, files in walk(root):
                   for f in files:
-                      if f == 'AndroidManifest.xml':
+                      if not f.endswith(('.kt', '.java')):
+                          continue
+                      fp = os.path.join(r, f)
+                      rel_dir = os.path.relpath(r, root)
+                      correct_pkg = NEW_PACKAGE if rel_dir == '.' else rel_dir.replace(os.sep, '.')
+                      try:
+                          text = open(fp, encoding='utf-8').read()
+                      except Exception as e:
+                          log(f"  WARNING: could not read {fp}: {e}")
+                          continue
+                      new_text, n = re.subn(
+                          r'^\s*package\s+[\w.]+\s*$',
+                          f'package {correct_pkg}',
+                          text, count=1, flags=re.MULTILINE
+                      )
+                      if n == 0:
+                          new_text = f'package {correct_pkg}\n\n' + text
+                      if new_text != text:
+                          open(fp, 'w', encoding='utf-8').write(new_text)
+                          fixed_pkg_count += 1
+          log(f"Corrected package declarations in {fixed_pkg_count} file(s).")
+
+          # ---------------------------------------------------------------
+          # STEP D: global textual cleanup - fix imports/refs to the OLD
+          # namespace anywhere they appear (gradle, manifest, xml, kt, java).
+          # We detect the old namespace fresh from build.gradle/.kts, since
+          # that's independent of the (now already-fixed) folder structure.
+          # ---------------------------------------------------------------
+          def detect_old_namespace():
+              for pattern in ('**/build.gradle.kts', '**/build.gradle'):
+                  for fp in glob.glob(os.path.join(REPO, pattern), recursive=True):
+                      try:
+                          text = open(fp, encoding='utf-8').read()
+                      except Exception:
+                          continue
+                      m = re.search(r'namespace\s*=?\s*"([\w.]+)"', text)
+                      if m:
+                          return m.group(1)
+              for pattern in ('**/build.gradle.kts', '**/build.gradle'):
+                  for fp in glob.glob(os.path.join(REPO, pattern), recursive=True):
+                      try:
+                          text = open(fp, encoding='utf-8').read()
+                      except Exception:
+                          continue
+                      m = re.search(r'applicationId\s*=?\s*"([\w.]+)"', text)
+                      if m:
+                          return m.group(1)
+              for r, dirs, files in walk(REPO):
+                  if 'AndroidManifest.xml' in files:
+                      fp = os.path.join(r, 'AndroidManifest.xml')
+                      text = open(fp, encoding='utf-8').read()
+                      m = re.search(r'package="([\w.]+)"', text)
+                      if m:
+                          return m.group(1)
+              return None
+
+          old_namespace = detect_old_namespace()
+          log(f"Detected old namespace for text cleanup: {old_namespace}")
+
+          TEXT_EXT = ('.kt', '.java', '.xml', '.gradle', '.kts', '.pro', '.properties', '.cfg')
+          if old_namespace and old_namespace != NEW_PACKAGE:
+              replaced_count = 0
+              for r, dirs, files in walk(REPO):
+                  for f in files:
+                      if f.endswith(TEXT_EXT):
                           fp = os.path.join(r, f)
                           try:
                               text = open(fp, encoding='utf-8').read()
                           except Exception:
                               continue
-                          m = re.search(r'package="([\w.]+)"', text)
-                          if m:
-                              return m.group(1)
-              # 2) Try build.gradle(.kts) applicationId / namespace
-              for pattern in ('**/build.gradle', '**/build.gradle.kts'):
-                  for fp in glob.glob(os.path.join(repo_root, pattern), recursive=True):
-                      try:
-                          text = open(fp, encoding='utf-8').read()
-                      except Exception:
-                          continue
-                      m = re.search(r'(?:applicationId|namespace)\s*[= ]\s*"([\w.]+)"', text)
-                      if m:
-                          return m.group(1)
-              return None
+                          if old_namespace in text:
+                              open(fp, 'w', encoding='utf-8').write(text.replace(old_namespace, NEW_PACKAGE))
+                              replaced_count += 1
+              log(f"Replaced remaining '{old_namespace}' references in {replaced_count} file(s).")
 
-          old_package = find_old_package()
-          if not old_package:
-              print("ERROR: could not auto-detect the existing package name.")
+          # ---------------------------------------------------------------
+          # STEP E: force namespace / applicationId in build.gradle(.kts),
+          # and strip any applicationIdSuffix so the final ID is EXACTLY
+          # NEW_PACKAGE with no ".debug" style suffix appended.
+          # ---------------------------------------------------------------
+          app_gradle_candidates = glob.glob(os.path.join(REPO, '**/app/build.gradle.kts'), recursive=True) + \
+                                   glob.glob(os.path.join(REPO, '**/app/build.gradle'), recursive=True)
+          app_gradle = app_gradle_candidates[0] if app_gradle_candidates else None
+
+          if app_gradle:
+              content = open(app_gradle, encoding='utf-8').read()
+
+              content, n1 = re.subn(r'namespace\s*=?\s*"[\w.]+"', f'namespace = "{NEW_PACKAGE}"' if app_gradle.endswith('.kts') else f'namespace "{NEW_PACKAGE}"', content)
+              content, n2 = re.subn(r'applicationId\s*=?\s*"[\w.]+"', f'applicationId = "{NEW_PACKAGE}"' if app_gradle.endswith('.kts') else f'applicationId "{NEW_PACKAGE}"', content)
+              content, n3 = re.subn(r'^\s*applicationIdSuffix\s*=?\s*"[^"]*"\s*$', '', content, flags=re.MULTILINE)
+
+              if 'play-services-ads' not in content:
+                  is_kts = app_gradle.endswith('.kts')
+                  dep_line = (
+                      f'    implementation("com.google.android.gms:play-services-ads:{ADS_VERSION}")'
+                      if is_kts else
+                      f"    implementation 'com.google.android.gms:play-services-ads:{ADS_VERSION}'"
+                  )
+                  content, nd = re.subn(r'(dependencies\s*\{)', r'\1\n' + dep_line, content, count=1)
+                  log(f"  AdMob dependency added: {bool(nd)}")
+
+              open(app_gradle, 'w', encoding='utf-8').write(content)
+              log(f"Updated {app_gradle} (namespace matched: {n1}, applicationId matched: {n2}, "
+                  f"applicationIdSuffix lines removed: {n3})")
+          else:
+              log("ERROR: could not find app/build.gradle or app/build.gradle.kts")
               sys.exit(1)
 
-          print(f"Detected old package: {old_package}")
-          print(f"New package:          {NEW_PACKAGE}")
+          # ---------------------------------------------------------------
+          # STEP F: AndroidManifest.xml - package attr, INTERNET permission,
+          # AdMob App ID meta-data.
+          # ---------------------------------------------------------------
+          manifest = None
+          for r, dirs, files in walk(REPO):
+              if 'AndroidManifest.xml' in files and os.path.join('src', 'main') in r:
+                  manifest = os.path.join(r, 'AndroidManifest.xml')
+                  break
+          if not manifest:
+              for r, dirs, files in walk(REPO):
+                  if 'AndroidManifest.xml' in files:
+                      manifest = os.path.join(r, 'AndroidManifest.xml')
+                      break
 
-          if old_package == NEW_PACKAGE:
-              print("Old and new package already match, skipping rename.")
-              sys.exit(0)
+          if manifest:
+              content = open(manifest, encoding='utf-8').read()
 
-          old_seg = old_package.replace('.', os.sep)
-          new_seg = NEW_PACKAGE.replace('.', os.sep)
+              content = re.sub(r'package="[\w.]+"', f'package="{NEW_PACKAGE}"', content)
 
-          TEXT_EXT = ('.kt', '.java', '.xml', '.gradle', '.kts', '.pro', '.properties', '.cfg')
+              if 'android.permission.INTERNET' not in content:
+                  content = re.sub(
+                      r'(<application)',
+                      '    <uses-permission android:name="android.permission.INTERNET" />\n\n\\1',
+                      content, count=1
+                  )
 
-          # 1) Replace every textual reference to the old package string
-          for r, dirs, files in walk(repo_root):
-              for f in files:
-                  if f.endswith(TEXT_EXT):
-                      fp = os.path.join(r, f)
-                      try:
-                          text = open(fp, encoding='utf-8').read()
-                      except Exception:
-                          continue
-                      if old_package in text:
-                          open(fp, 'w', encoding='utf-8').write(text.replace(old_package, NEW_PACKAGE))
-                          print(f"  updated refs: {fp}")
+              if 'com.google.android.gms.ads.APPLICATION_ID' not in content:
+                  meta = (
+                      '        <meta-data\n'
+                      '            android:name="com.google.android.gms.ads.APPLICATION_ID"\n'
+                      f'            android:value="{ADMOB_APP_ID}" />\n'
+                  )
+                  content = re.sub(r'(\s*</application>)', '\n' + meta + r'\1', content, count=1)
 
-          # 2) Move any source directory tree ending in the old package path
-          #    (covers src/main/java, src/main/kotlin, src/debug, src/androidTest, etc.)
-          moved_any = True
-          while moved_any:
-              moved_any = False
-              for r, dirs, files in walk(repo_root):
-                  if r.endswith(old_seg) and os.path.isdir(r):
-                      new_dir = r[: -len(old_seg)] + new_seg
-                      os.makedirs(os.path.dirname(new_dir), exist_ok=True)
-                      if os.path.exists(new_dir):
-                          for item in os.listdir(r):
-                              shutil.move(os.path.join(r, item), os.path.join(new_dir, item))
-                          shutil.rmtree(r, ignore_errors=True)
-                      else:
-                          shutil.move(r, new_dir)
-                      print(f"  moved dir: {r} -> {new_dir}")
-                      moved_any = True
-                      break  # os.walk state is now stale, restart scan
+              open(manifest, 'w', encoding='utf-8').write(content)
+              log(f"Updated manifest: {manifest}")
+          else:
+              log("ERROR: no AndroidManifest.xml found")
+              sys.exit(1)
 
-          # 3) Clean up now-empty leftover package directories
-          for r, dirs, files in os.walk(repo_root, topdown=False):
-              if any(s in r for s in SKIP_DIRS):
-                  continue
-              try:
-                  if not os.listdir(r) and r != repo_root:
-                      os.rmdir(r)
-              except Exception:
-                  pass
-
-          print("Package rename complete.")
-          PYEOF
-          python3 /tmp/rename_package.py
-
-      # ---------------------------------------------------------------
-      # STEP 2: Update app name in strings.xml
-      # ---------------------------------------------------------------
-      - name: Update app name in strings.xml
-        run: |
-          cat > /tmp/rename_app.py << 'PYEOF'
-          import os, re
-
-          NEW_APP_NAME = os.environ["NEW_APP_NAME"]
-          SKIP_DIRS = {'.git', 'build', '.gradle', '.idea'}
-          found = False
-
-          for r, dirs, files in os.walk(os.getcwd()):
-              dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+          # ---------------------------------------------------------------
+          # STEP G: strings.xml app_name
+          # ---------------------------------------------------------------
+          strings_updated = 0
+          for r, dirs, files in walk(REPO):
               for f in files:
                   if f == 'strings.xml':
                       fp = os.path.join(r, f)
@@ -164,155 +318,59 @@ jobs:
                       )
                       if n:
                           open(fp, 'w', encoding='utf-8').write(new_text)
-                          print(f"  updated app_name in {fp}")
-                          found = True
+                          strings_updated += 1
+          log(f"Updated app_name in {strings_updated} strings.xml file(s).")
 
-          if not found:
-              print("WARNING: no app_name string found in any strings.xml")
-          PYEOF
-          python3 /tmp/rename_app.py
-
-      # ---------------------------------------------------------------
-      # STEP 3: AdMob dependency + manifest (permission, App ID)
-      # ---------------------------------------------------------------
-      - name: Add AdMob dependency and manifest entries
-        run: |
-          cat > /tmp/setup_admob.py << 'PYEOF'
-          import os, re, glob
-
-          ADMOB_APP_ID = os.environ["ADMOB_APP_ID"]
-          SKIP_DIRS = {'.git', 'build', '.gradle', '.idea'}
-          ADS_VERSION = "23.6.0"
-
-          # --- Dependency injection ------------------------------------------------
-          app_gradle = None
-          for pattern in ('**/app/build.gradle', '**/app/build.gradle.kts'):
-              matches = glob.glob(os.path.join(os.getcwd(), pattern), recursive=True)
-              if matches:
-                  app_gradle = matches[0]
-                  break
-
-          if app_gradle:
-              content = open(app_gradle, encoding='utf-8').read()
-              if 'play-services-ads' not in content:
-                  is_kts = app_gradle.endswith('.kts')
-                  dep_line = (
-                      f'    implementation("com.google.android.gms:play-services-ads:{ADS_VERSION}")'
-                      if is_kts else
-                      f"    implementation 'com.google.android.gms:play-services-ads:{ADS_VERSION}'"
-                  )
-                  new_content, n = re.subn(r'(dependencies\s*\{)', r'\1\n' + dep_line, content, count=1)
-                  if n:
-                      open(app_gradle, 'w', encoding='utf-8').write(new_content)
-                      print(f"  added AdMob dependency to {app_gradle}")
-                  else:
-                      print(f"  WARNING: no dependencies block found in {app_gradle}")
-              else:
-                  print(f"  AdMob dependency already present in {app_gradle}")
-          else:
-              print("  WARNING: could not find app/build.gradle(.kts)")
-
-          # --- Manifest: INTERNET permission + AdMob App ID meta-data ---------------
-          manifest = None
-          for r, dirs, files in os.walk(os.getcwd()):
-              dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
-              if os.path.join('app', 'src', 'main') in r or r.endswith(os.path.join('src', 'main')):
-                  if 'AndroidManifest.xml' in files:
-                      manifest = os.path.join(r, 'AndroidManifest.xml')
-                      break
-              if manifest:
-                  break
-
-          if not manifest:
-              # fallback: any AndroidManifest.xml in the repo
-              for r, dirs, files in os.walk(os.getcwd()):
-                  dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
-                  if 'AndroidManifest.xml' in files:
-                      manifest = os.path.join(r, 'AndroidManifest.xml')
-                      break
-
-          if manifest:
-              content = open(manifest, encoding='utf-8').read()
-              changed = False
-
-              if 'android.permission.INTERNET' not in content:
-                  content, n = re.subn(
-                      r'(<application)',
-                      '    <uses-permission android:name="android.permission.INTERNET" />\n\n\\1',
-                      content, count=1
-                  )
-                  if n:
-                      changed = True
-
-              if 'com.google.android.gms.ads.APPLICATION_ID' not in content:
-                  meta = (
-                      '        <meta-data\n'
-                      '            android:name="com.google.android.gms.ads.APPLICATION_ID"\n'
-                      f'            android:value="{ADMOB_APP_ID}" />\n'
-                  )
-                  content, n = re.subn(r'(\s*</application>)', '\n' + meta + r'\1', content, count=1)
-                  if n:
-                      changed = True
-
-              if changed:
-                  open(manifest, 'w', encoding='utf-8').write(content)
-                  print(f"  updated manifest: {manifest}")
-              else:
-                  print(f"  manifest already had permission/App ID: {manifest}")
-          else:
-              print("  WARNING: could not find AndroidManifest.xml")
-          PYEOF
-          python3 /tmp/setup_admob.py
-
-      # ---------------------------------------------------------------
-      # STEP 4: Inject Banner + Interstitial ads into HomeActivity.kt
-      # ---------------------------------------------------------------
-      - name: Inject AdMob ads into HomeActivity.kt
-        run: |
-          cat > /tmp/inject_ads.py << 'PYEOF'
-          import os, re
-
-          BANNER_ID = os.environ["ADMOB_BANNER_ID"]
-          INTERSTITIAL_ID = os.environ["ADMOB_INTERSTITIAL_ID"]
-          SKIP_DIRS = {'.git', 'build', '.gradle', '.idea'}
-
+          # ---------------------------------------------------------------
+          # STEP H: inject AdMob into HomeActivity.kt (now at its NEW path)
+          # ---------------------------------------------------------------
           home_activity = None
-          for r, dirs, files in os.walk(os.getcwd()):
-              dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+          for r, dirs, files in walk(REPO):
               if 'HomeActivity.kt' in files:
                   home_activity = os.path.join(r, 'HomeActivity.kt')
                   break
 
           if not home_activity:
-              print("WARNING: HomeActivity.kt not found, skipping ad injection")
-          else:
-              content = open(home_activity, encoding='utf-8').read()
+              log("ERROR: HomeActivity.kt not found anywhere in the repo after rebrand.")
+              sys.exit(1)
 
-              imports_needed = [
-                  "import com.google.android.gms.ads.AdRequest",
-                  "import com.google.android.gms.ads.AdSize",
-                  "import com.google.android.gms.ads.AdView",
-                  "import com.google.android.gms.ads.MobileAds",
-                  "import com.google.android.gms.ads.LoadAdError",
-                  "import com.google.android.gms.ads.interstitial.InterstitialAd",
-                  "import com.google.android.gms.ads.interstitial.InterstitialAdLoadCallback",
-              ]
-              missing_imports = [i for i in imports_needed if i not in content]
-              if missing_imports:
-                  block = "\n".join(missing_imports) + "\n"
-                  new_content, n = re.subn(r'(^package [\w.]+\n)', r'\1' + block, content, count=1, flags=re.MULTILINE)
-                  if n:
-                      content = new_content
-                  else:
-                      content = block + content
+          expected_dir = os.path.join(NEW_PATH)
+          if expected_dir not in home_activity.replace(os.sep, os.sep):
+              log(f"WARNING: HomeActivity.kt found at {home_activity}, which does not "
+                  f"look like it's under the new package path ({NEW_PATH}). Continuing anyway.")
 
-              if 'MobileAds.initialize' not in content:
-                  init_block = f'''
+          content = open(home_activity, encoding='utf-8').read()
+
+          imports_needed = [
+              "import com.google.android.gms.ads.AdRequest",
+              "import com.google.android.gms.ads.AdSize",
+              "import com.google.android.gms.ads.AdView",
+              "import com.google.android.gms.ads.MobileAds",
+              "import com.google.android.gms.ads.LoadAdError",
+              "import com.google.android.gms.ads.interstitial.InterstitialAd",
+              "import com.google.android.gms.ads.interstitial.InterstitialAdLoadCallback",
+              "import android.view.ViewGroup",
+          ]
+          missing = [i for i in imports_needed if i not in content]
+          if missing:
+              block = "\n".join(missing) + "\n"
+              new_content, n = re.subn(r'(^package [\w.]+\n)', r'\1\n' + block, content, count=1, flags=re.MULTILINE)
+              content = new_content if n else block + content
+
+          if 'MobileAds.initialize' not in content:
+              init_block = f'''
               MobileAds.initialize(this) {{}}
 
               val appForgeAdView = AdView(this)
               appForgeAdView.adUnitId = "{BANNER_ID}"
               appForgeAdView.setAdSize(AdSize.BANNER)
+              addContentView(
+                  appForgeAdView,
+                  ViewGroup.LayoutParams(
+                      ViewGroup.LayoutParams.MATCH_PARENT,
+                      ViewGroup.LayoutParams.WRAP_CONTENT
+                  )
+              )
               appForgeAdView.loadAd(AdRequest.Builder().build())
 
               var appForgeInterstitialAd: InterstitialAd? = null
@@ -330,24 +388,55 @@ jobs:
                   }}
               )
           '''
+              new_content, n = re.subn(
+                  r'(setContentView\([^)]*\)\s*\n)',
+                  r'\1' + init_block,
+                  content, count=1
+              )
+              if not n:
                   new_content, n = re.subn(
                       r'(super\.onCreate\(savedInstanceState\)\s*\n)',
                       r'\1' + init_block,
                       content, count=1
                   )
-                  if n:
-                      content = new_content
-                      print(f"  injected AdMob init code into {home_activity}")
-                  else:
-                      print(f"  WARNING: could not find onCreate() in {home_activity}, ad init not inserted")
+              if n:
+                  content = new_content
+                  log(f"Injected AdMob init code into {home_activity}")
+              else:
+                  log(f"ERROR: could not find setContentView() or super.onCreate() "
+                      f"in {home_activity} - ad code NOT inserted (avoiding a crash).")
+                  sys.exit(1)
 
-              open(home_activity, 'w', encoding='utf-8').write(content)
+          open(home_activity, 'w', encoding='utf-8').write(content)
+
+          log("Rebrand + AdMob injection complete.")
           PYEOF
-          python3 /tmp/inject_ads.py
+          python3 /tmp/rebrand.py
 
-      # ---------------------------------------------------------------
-      # STEP 5: Build the APK
-      # ---------------------------------------------------------------
+      # ---------------------------------------------------------------------
+      # Fail fast if the rebrand didn't actually take - better than shipping
+      # a broken APK.
+      # ---------------------------------------------------------------------
+      - name: Verify rebrand actually applied
+        run: |
+          echo "== app/build.gradle(.kts) namespace/applicationId =="
+          grep -R -E "namespace|applicationId" --include="build.gradle*" . || true
+          echo ""
+          echo "== HomeActivity.kt location =="
+          find . -name "HomeActivity.kt" -not -path "*/build/*"
+          echo ""
+          echo "== Any leftover old package folders under com/valhalla (if this repo used that) =="
+          find . -type d -path "*com/valhalla*" -not -path "*/build/*" || true
+
+          if ! grep -R "com.nexus.appforge" --include="build.gradle*" . > /dev/null; then
+            echo "::error::New package 'com.nexus.appforge' not found in any build.gradle file - aborting."
+            exit 1
+          fi
+          if ! find . -path "*com/nexus/appforge/HomeActivity.kt" -not -path "*/build/*" | grep -q .; then
+            echo "::error::HomeActivity.kt is not located under the new package path - aborting."
+            exit 1
+          fi
+
       - name: Grant execute permission for gradlew
         run: chmod +x ./gradlew
 
