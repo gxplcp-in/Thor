@@ -110,6 +110,14 @@ jobs:
 
           old_path = old_namespace.replace('.', os.sep)
 
+          # Shared boundary-safe pattern for the old namespace, used by every
+          # later step (global text replace, schema dir rename, leftover scan)
+          # so detection stays perfectly consistent throughout the script.
+          old_ns_pattern = (
+              re.compile(re.escape(old_namespace) + r'(?![A-Za-z0-9_])')
+              if old_namespace != NEW_PACKAGE else None
+          )
+
           # ---------------------------------------------------------------
           # STEP B: find every java/kotlin source root, and for each one
           # that contains root/<old_path>, move that EXACT directory to
@@ -254,7 +262,6 @@ jobs:
           # ---------------------------------------------------------------
           TEXT_EXT = ('.kt', '.java', '.xml', '.gradle', '.kts', '.pro', '.properties', '.cfg')
           if old_namespace and old_namespace != NEW_PACKAGE:
-              old_ns_pattern = re.compile(re.escape(old_namespace) + r'(?![A-Za-z0-9_])')
               replaced_count = 0
               touched_files = []
               for r, dirs, files in walk(REPO):
@@ -295,6 +302,56 @@ jobs:
                               f"still references the old namespace after cleanup - check manually.")
                       else:
                           log(f"  {fp}: <application> android:name=\"{app_name_attr}\" looks correct.")
+
+          # ---------------------------------------------------------------
+          # STEP D3: rename Room auto-migration schema directories.
+          #
+          # Room's schema exporter (ksp { arg("room.schemaLocation", ...) })
+          # writes one folder PER @Database class under e.g. app/schemas/,
+          # and that folder is named with the database's FULLY-QUALIFIED
+          # CLASS NAME using DOTS, not a nested path -
+          # e.g. "app/schemas/com.valhalla.thor.data.source.local.room.AppDatabase/2.json"
+          # This lives outside src/, so the src/-only directory move in
+          # Step B never touches it. Auto-migrations fail if this folder's
+          # name still points at the old package. We rename any directory
+          # directly under a folder named "schemas" whose name matches the
+          # old namespace, wherever "schemas" appears in the repo.
+          # ---------------------------------------------------------------
+          if old_namespace and old_namespace != NEW_PACKAGE:
+              schema_dirs_to_rename = []
+              for r, dirs, files in walk(REPO):
+                  if os.path.basename(r) == 'schemas':
+                      for d in dirs:
+                          if old_ns_pattern.search(d):
+                              schema_dirs_to_rename.append((r, d))
+
+              schema_renamed = 0
+              for r, d in schema_dirs_to_rename:
+                  old_full = os.path.join(r, d)
+                  new_name = old_ns_pattern.sub(NEW_PACKAGE, d)
+                  new_full = os.path.join(r, new_name)
+                  if not os.path.isdir(old_full):
+                      continue
+                  try:
+                      if os.path.exists(new_full):
+                          for item in os.listdir(old_full):
+                              dest = os.path.join(new_full, item)
+                              if os.path.exists(dest):
+                                  shutil.rmtree(dest) if os.path.isdir(dest) else os.remove(dest)
+                              shutil.move(os.path.join(old_full, item), dest)
+                          shutil.rmtree(old_full, ignore_errors=True)
+                      else:
+                          shutil.move(old_full, new_full)
+                  except Exception as e:
+                      log(f"ERROR: failed to rename schema dir {old_full} -> {new_full}: {e}")
+                      sys.exit(1)
+                  log(f"  renamed Room schema dir: {old_full} -> {new_full}")
+                  schema_renamed += 1
+
+              if schema_renamed:
+                  log(f"Renamed {schema_renamed} Room schema director{'y' if schema_renamed == 1 else 'ies'}.")
+              else:
+                  log("No Room schema directories needed renaming (none found, or project has no schemas/ folder).")
 
           # ---------------------------------------------------------------
           # STEP E: force namespace / applicationId in build.gradle(.kts),
@@ -478,24 +535,6 @@ jobs:
           open(home_activity, 'w', encoding='utf-8').write(content)
 
           # ---------------------------------------------------------------
-          # STEP H2: Rename Room Database Schema Folders (NEW FIX)
-          # ---------------------------------------------------------------
-          if old_namespace and old_namespace != NEW_PACKAGE:
-              log("Scanning for Room schema folders...")
-              for r, dirs, files in os.walk("."):
-                  if "schemas" in dirs:
-                      schemas_dir = os.path.join(r, "schemas")
-                      # Bottom-up scan to avoid breaking paths while renaming
-                      for schema_root, schema_dirs, schema_files in os.walk(schemas_dir, topdown=False):
-                          for d in schema_dirs:
-                              if old_namespace in d:
-                                  old_path = os.path.join(schema_root, d)
-                                  new_name = d.replace(old_namespace, NEW_PACKAGE)
-                                  new_path = os.path.join(schema_root, new_name)
-                                  os.rename(old_path, new_path)
-                                  log(f"Renamed Room Schema Folder: {old_path} -> {new_path}")
-
-          # ---------------------------------------------------------------
           # STEP I: final leftover-reference scan. If ANY file anywhere in
           # the repo still contains the old namespace after every step
           # above, fail loudly here with exact file:line - rather than let
@@ -506,9 +545,18 @@ jobs:
           # the old package is a near-certain cause.
           # ---------------------------------------------------------------
           if old_namespace and old_namespace != NEW_PACKAGE:
-              leftover_pattern = re.compile(re.escape(old_namespace) + r'(?![A-Za-z0-9_])')
               leftovers = []
+              leftover_paths = []
               for r, dirs, files in walk(REPO):
+                  # flag any leftover directory or file NAME containing the old
+                  # namespace too (e.g. an un-renamed schemas/ subfolder, or
+                  # anything the schema-rename step above didn't recognize)
+                  for d in dirs:
+                      if old_ns_pattern.search(d):
+                          leftover_paths.append(os.path.join(r, d) + '/')
+                  for f in files:
+                      if old_ns_pattern.search(f):
+                          leftover_paths.append(os.path.join(r, f))
                   for f in files:
                       if f.endswith(TEXT_EXT):
                           fp = os.path.join(r, f)
@@ -517,13 +565,16 @@ jobs:
                           except Exception:
                               continue
                           for i, line in enumerate(lines, start=1):
-                              if leftover_pattern.search(line):
+                              if old_ns_pattern.search(line):
                                   leftovers.append((fp, i, line.strip()))
 
-              if leftovers:
-                  log(f"ERROR: found {len(leftovers)} leftover reference(s) to "
+              if leftovers or leftover_paths:
+                  total = len(leftovers) + len(leftover_paths)
+                  log(f"ERROR: found {total} leftover reference(s) to "
                       f"'{old_namespace}' after the rebrand - this is very likely "
                       f"what will break KSP/Room/Hilt or the build. Fix these and re-run:")
+                  for p in leftover_paths:
+                      log(f"    PATH: {p}")
                   for fp, i, line in leftovers:
                       log(f"    {fp}:{i}: {line}")
                   sys.exit(1)
