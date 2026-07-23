@@ -663,12 +663,18 @@ jobs:
         if: failure()
         run: |
           echo "=================================================================="
-          echo "The lines below are the actual 'e: ' compiler diagnostics from"
-          echo "kotlinc/KSP/javac, pulled out of the full --info log so they are"
-          echo "not buried under the generic Gradle stack trace."
+          echo "Kotlin 2.x (K2) reports errors as structured 'Problem found:' blocks"
+          echo "under --info, NOT classic 'e: file:line' lines - so we grep for both"
+          echo "formats here plus a few lines of context around each match."
           echo "=================================================================="
+          echo ""
+          echo "---- structured Kotlin/KSP compiler problems (with context) ----"
+          grep -n -A4 "Problem found: Kotlin compiler error\|Problem found: KSP" /tmp/gradle_build.log || \
+            echo "(none found)"
+          echo ""
+          echo "---- classic 'e: '/'error:' lines, if any ----"
           grep -nE "^e: |error:|FAILURE: Build failed" /tmp/gradle_build.log || \
-            echo "(no lines matched 'e: '/'error:' - showing the last 200 log lines instead)"
+            echo "(none found)"
           echo ""
           echo "---- last 200 lines of the full build log, for context ----"
           tail -n 200 /tmp/gradle_build.log
