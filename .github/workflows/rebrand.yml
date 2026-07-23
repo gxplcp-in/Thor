@@ -513,23 +513,65 @@ jobs:
                   }}
               )
           '''
-              new_content, n = re.subn(
-                  r'(setContentView\([^)]*\)\s*\n)',
-                  r'\1' + init_block,
-                  content, count=1
-              )
-              if not n:
-                  new_content, n = re.subn(
-                      r'(super\.onCreate\(savedInstanceState\)\s*\n)',
-                      r'\1' + init_block,
-                      content, count=1
-                  )
-              if n:
+              # A plain regex like setContentView\([^)]*\) cannot handle nested
+              # parens - it either matches a simple call or safely fails to
+              # match at all (it can never produce a corrupting partial match,
+              # since it requires whitespace immediately after the paren it
+              # captures). But it silently misses very common real-world
+              # calls like setContentView(SomeBinding.inflate(layoutInflater).root),
+              # falling back to a less ideal insertion point. We use a real
+              # balanced-paren scan instead, so the full call - nested parens
+              # and all - is found correctly.
+              def find_call_end(text, call_name):
+                  idx = text.find(call_name + '(')
+                  if idx == -1:
+                      return None
+                  open_idx = idx + len(call_name)
+                  depth = 0
+                  i = open_idx
+                  while i < len(text):
+                      if text[i] == '(':
+                          depth += 1
+                      elif text[i] == ')':
+                          depth -= 1
+                          if depth == 0:
+                              # include trailing whitespace up to and including
+                              # the next newline, matching the old regex's \s*\n
+                              j = i + 1
+                              while j < len(text) and text[j] in ' \t':
+                                  j += 1
+                              if j < len(text) and text[j] == '\n':
+                                  j += 1
+                              return j
+                      i += 1
+                  return None  # unbalanced parens in the source file itself
+
+              insert_at = find_call_end(content, 'setContentView')
+              insertion_label = 'after setContentView(...)'
+              if insert_at is None:
+                  insert_at = find_call_end(content, 'super.onCreate')
+                  insertion_label = 'after super.onCreate(...)'
+
+              if insert_at is not None:
+                  new_content = content[:insert_at] + init_block + content[insert_at:]
                   content = new_content
-                  log(f"Injected AdMob init code into {home_activity}")
+                  log(f"Injected AdMob init code into {home_activity} ({insertion_label})")
               else:
                   log(f"ERROR: could not find setContentView() or super.onCreate() "
                       f"in {home_activity} - ad code NOT inserted (avoiding a crash).")
+                  sys.exit(1)
+
+              # Safety net: verify the file is still brace/paren-balanced after
+              # injection. If not, something about this specific file's shape
+              # broke our insertion - fail here with a clear message instead of
+              # letting a CompilationErrorException surface three steps later
+              # with no indication of which file or why.
+              open_b, close_b = content.count('{'), content.count('}')
+              open_p, close_p = content.count('('), content.count(')')
+              if open_b != close_b or open_p != close_p:
+                  log(f"ERROR: {home_activity} is unbalanced after AdMob injection "
+                      f"(braces {open_b}/{close_b}, parens {open_p}/{close_p}). "
+                      f"Aborting rather than shipping a file that won't compile.")
                   sys.exit(1)
 
           open(home_activity, 'w', encoding='utf-8').write(content)
@@ -613,7 +655,23 @@ jobs:
         run: chmod +x ./gradlew
 
       - name: Build debug APK
-        run: ./gradlew assembleDebug --stacktrace
+        run: |
+          set -o pipefail
+          ./gradlew assembleDebug --stacktrace --info 2>&1 | tee /tmp/gradle_build.log
+
+      - name: Show exact compiler error lines (only runs if the build failed)
+        if: failure()
+        run: |
+          echo "=================================================================="
+          echo "The lines below are the actual 'e: ' compiler diagnostics from"
+          echo "kotlinc/KSP/javac, pulled out of the full --info log so they are"
+          echo "not buried under the generic Gradle stack trace."
+          echo "=================================================================="
+          grep -nE "^e: |error:|FAILURE: Build failed" /tmp/gradle_build.log || \
+            echo "(no lines matched 'e: '/'error:' - showing the last 200 log lines instead)"
+          echo ""
+          echo "---- last 200 lines of the full build log, for context ----"
+          tail -n 200 /tmp/gradle_build.log
 
       - name: Locate APK
         id: locate_apk
@@ -632,3 +690,11 @@ jobs:
           name: AppForge-Manager-debug-apk
           path: ${{ steps.locate_apk.outputs.apk_path }}
           if-no-files-found: error
+
+      - name: Upload full build log (always, for debugging)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gradle-build-log
+          path: /tmp/gradle_build.log
+          if-no-files-found: ignore
