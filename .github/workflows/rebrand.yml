@@ -11,6 +11,19 @@ env:
   ADMOB_APP_ID: "ca-app-pub-2804137706627200~6481242898"
   ADMOB_BANNER_ID: "ca-app-pub-2804137706627200/8125497050"
   ADMOB_INTERSTITIAL_ID: "ca-app-pub-2804137706627200/4152638624"
+  # Subpackages under the OLD namespace that must be left completely untouched
+  # (not moved, not text-replaced, not flagged as "leftover"). Comma-separated,
+  # relative to the old namespace root - e.g. "extension" means
+  # com.valhalla.thor.extension.* is preserved exactly as-is.
+  #
+  # com.valhalla.thor.extension.api.Logger / .AppIconModel are referenced only
+  # via fully-qualified name + a typealias in ThorApplication.kt / AppIconLoader.kt
+  # (never a plain import) - a strong signal this is a stable, separately-scoped
+  # API surface (plugin/extension SDK) that isn't meant to move with an app
+  # rebrand, and quite possibly isn't even source in this repo (could be a
+  # published dependency). Renaming references to it produces exactly the
+  # "Unresolved reference" cascade seen in the KSP/Kotlin errors.
+  EXCLUDED_SUBPACKAGES: "extension"
 
 jobs:
   build:
@@ -54,9 +67,23 @@ jobs:
           INTERSTITIAL_ID = os.environ["ADMOB_INTERSTITIAL_ID"]
           ADS_VERSION = "23.6.0"
           SKIP_DIRS = {'.git', 'build', '.gradle', '.idea', 'node_modules'}
+          EXCLUDED_SUBPACKAGES = [
+              s.strip() for s in os.environ.get("EXCLUDED_SUBPACKAGES", "").split(',') if s.strip()
+          ]
+          # matches these as ".extension", ".extension.foo" etc so we only exclude
+          # the subpackage itself, never a sibling that merely shares a prefix
+          # (e.g. "extension" must not also suppress renaming "extensionhelpers")
+          EXCLUDED_SUFFIXES = tuple('.' + s for s in EXCLUDED_SUBPACKAGES)
 
           def log(msg):
               print(f"[rebrand] {msg}", flush=True)
+
+          def is_excluded_occurrence(text, match_end):
+              """True if the old-namespace match ending at match_end is immediately
+              followed by one of the excluded subpackage names, e.g. the match for
+              'com.valhalla.thor' inside 'com.valhalla.thor.extension.api.Logger'
+              when 'extension' is in EXCLUDED_SUBPACKAGES."""
+              return any(text[match_end:match_end + len(suf)] == suf for suf in EXCLUDED_SUFFIXES)
 
           def walk(root):
               for r, dirs, files in os.walk(root):
@@ -153,6 +180,20 @@ jobs:
                       continue
 
                   log(f"  found old package folder: {old_dir}")
+
+                  # Carve out any excluded subpackages BEFORE moving, so they end
+                  # up back at their EXACT original path, completely undisturbed -
+                  # e.g. com/valhalla/thor/extension stays put while everything
+                  # else under com/valhalla/thor moves to com/nexus/appforge.
+                  carve_outs = []  # (original_full_path, temp_holding_path)
+                  for excl in EXCLUDED_SUBPACKAGES:
+                      excl_full = os.path.join(old_dir, excl)
+                      if os.path.isdir(excl_full):
+                          tmp_holder = excl_full + '.__preserve_tmp__'
+                          shutil.move(excl_full, tmp_holder)
+                          carve_outs.append((excl_full, tmp_holder))
+                          log(f"  preserving excluded subpackage untouched: {excl_full}")
+
                   os.makedirs(os.path.dirname(new_dir), exist_ok=True)
 
                   try:
@@ -176,6 +217,12 @@ jobs:
                   if not os.path.isdir(new_dir):
                       log(f"ERROR: move reported success but {new_dir} does not exist.")
                       sys.exit(1)
+
+                  # restore carved-out excluded subpackages to their exact original path
+                  for orig_full, tmp_holder in carve_outs:
+                      os.makedirs(os.path.dirname(orig_full), exist_ok=True)
+                      shutil.move(tmp_holder, orig_full)
+                      log(f"  restored excluded subpackage untouched: {orig_full}")
 
                   log(f"  MOVED: {old_dir} -> {new_dir}")
                   moved_count += 1
@@ -203,6 +250,46 @@ jobs:
                       depth = r[len(root):].count(os.sep)
                       log(f"    {'  ' * depth}{os.path.relpath(r, root)}/")
               sys.exit(1)
+
+          # ---------------------------------------------------------------
+          # STEP B2: figure out which sub-namespaces under old_namespace are
+          # actually LOCAL SOURCE CODE we just moved, vs. a namespace that
+          # merely SHARES the old_namespace text prefix but belongs to an
+          # externally-published dependency (e.g. a library artifact whose
+          # groupId/package happens to start with the same words as the
+          # app's old package, such as "<old_namespace>.extension.api.*"
+          # shipped as a separate .aar/.jar). We can NEVER rename a
+          # reference to compiled bytecode we don't control - doing so
+          # produces a reference to a class that doesn't exist, which is
+          # exactly what breaks the build. local_packages is every dotted
+          # subpackage path that genuinely exists inside the moved tree;
+          # anything else sharing the old_namespace prefix is left alone.
+          # ---------------------------------------------------------------
+          local_packages = {''}
+          for _root, _new_dir in moved_dirs:
+              for r, dirs, files in walk(_new_dir):
+                  rel = os.path.relpath(r, _new_dir)
+                  local_packages.add('' if rel == '.' else rel.replace(os.sep, '.'))
+
+          def is_local_continuation(cont):
+              """cont is whatever follows old_namespace in a match, e.g.
+              '.util.Logger', '.util.*', or '' for a bare match. Returns True
+              if this continuation corresponds to something that actually
+              exists in the moved local source tree (safe to rename), False
+              if it looks like a reference to an external dependency
+              (leave untouched)."""
+              if cont == '':
+                  return True
+              parts = [p for p in cont.lstrip('.').split('.') if p]
+              if parts and parts[-1] == '*':
+                  parts = parts[:-1]
+              if not parts:
+                  return True
+              if '.'.join(parts) in local_packages:
+                  return True  # whole continuation is itself a local package (wildcard import case)
+              if '.'.join(parts[:-1]) in local_packages:
+                  return True  # continuation minus its last segment (a class/symbol name) is local
+              return False
 
           # ---------------------------------------------------------------
           # STEP C: rewrite the package line of files INSIDE THE MOVED
@@ -263,6 +350,7 @@ jobs:
           TEXT_EXT = ('.kt', '.java', '.xml', '.gradle', '.kts', '.pro', '.properties', '.cfg')
           if old_namespace and old_namespace != NEW_PACKAGE:
               replaced_count = 0
+              excluded_count = 0
               touched_files = []
               for r, dirs, files in walk(REPO):
                   for f in files:
@@ -272,12 +360,31 @@ jobs:
                               text = open(fp, encoding='utf-8').read()
                           except Exception:
                               continue
-                          new_text, n = old_ns_pattern.subn(NEW_PACKAGE, text)
-                          if n:
+
+                          local_hits = [0]
+                          excluded_hits = [0]
+
+                          def _repl(m, _text=text):
+                              cont_slice = _text[m.end():m.end() + 200]
+                              cm = re.match(r'(\.[A-Za-z_][A-Za-z0-9_.]*|\.\*)?', cont_slice)
+                              continuation = cm.group(0) if cm else ''
+                              if is_local_continuation(continuation):
+                                  local_hits[0] += 1
+                                  return NEW_PACKAGE
+                              excluded_hits[0] += 1
+                              return m.group(0)
+
+                          new_text = old_ns_pattern.sub(_repl, text)
+                          if local_hits[0]:
                               open(fp, 'w', encoding='utf-8').write(new_text)
                               replaced_count += 1
-                              touched_files.append((fp, n))
-              log(f"Replaced remaining '{old_namespace}' references in {replaced_count} file(s):")
+                              touched_files.append((fp, local_hits[0]))
+                          if excluded_hits[0]:
+                              excluded_count += excluded_hits[0]
+                              log(f"  preserved {excluded_hits[0]} external/excluded "
+                                  f"reference(s) untouched in {fp}")
+              log(f"Replaced remaining '{old_namespace}' references in {replaced_count} file(s) "
+                  f"({excluded_count} external/excluded occurrence(s) deliberately left untouched):")
               for fp, n in touched_files:
                   log(f"    {fp}  ({n} occurrence(s))")
 
@@ -607,8 +714,13 @@ jobs:
                           except Exception:
                               continue
                           for i, line in enumerate(lines, start=1):
-                              if old_ns_pattern.search(line):
-                                  leftovers.append((fp, i, line.strip()))
+                              for m in old_ns_pattern.finditer(line):
+                                  cont_slice = line[m.end():m.end() + 200]
+                                  cm = re.match(r'(\.[A-Za-z_][A-Za-z0-9_.]*|\.\*)?', cont_slice)
+                                  continuation = cm.group(0) if cm else ''
+                                  if is_local_continuation(continuation):
+                                      leftovers.append((fp, i, line.strip()))
+                                      break  # one flag per line is enough detail
 
               if leftovers or leftover_paths:
                   total = len(leftovers) + len(leftover_paths)
