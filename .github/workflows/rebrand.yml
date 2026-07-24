@@ -908,11 +908,28 @@ jobs:
       - name: Build debug APK
         run: |
           set -o pipefail
+          touch /tmp/gradle_build.log
           ./gradlew assembleDebug --stacktrace --info 2>&1 | tee /tmp/gradle_build.log
 
       - name: Show exact compiler error lines (only runs if the build failed)
         if: failure()
         run: |
+          if [ ! -s /tmp/gradle_build.log ]; then
+            echo "=================================================================="
+            echo "No Gradle build log exists (or it's empty) - this means the"
+            echo "failure happened in an EARLIER step, before ./gradlew"
+            echo "assembleDebug ever ran. Most likely candidates:"
+            echo "  - 'Rebrand package, app name, and inject AdMob'"
+            echo "  - 'Verify rebrand actually applied'"
+            echo ""
+            echo "Both of those print explicit 'ERROR: ...' lines directly in"
+            echo "their OWN step output (visible above, in a separate log group"
+            echo "from this one) explaining exactly what went wrong and why -"
+            echo "scroll up to that step to see it. There is nothing to show"
+            echo "here because Gradle itself was never invoked."
+            echo "=================================================================="
+            exit 0
+          fi
           echo "=================================================================="
           echo "Kotlin 2.x (K2) reports errors as structured 'Problem found:' blocks"
           echo "under --info, NOT classic 'e: file:line' lines - so we grep for both"
