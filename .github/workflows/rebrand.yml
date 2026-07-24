@@ -185,11 +185,15 @@ jobs:
                   # up back at their EXACT original path, completely undisturbed -
                   # e.g. com/valhalla/thor/extension stays put while everything
                   # else under com/valhalla/thor moves to com/nexus/appforge.
+                  # The temp holder MUST live outside old_dir (as a sibling,
+                  # not nested inside it) - otherwise the whole-tree move a
+                  # few lines below sweeps the placeholder away with it,
+                  # before the restore step ever runs.
                   carve_outs = []  # (original_full_path, temp_holding_path)
                   for excl in EXCLUDED_SUBPACKAGES:
                       excl_full = os.path.join(old_dir, excl)
                       if os.path.isdir(excl_full):
-                          tmp_holder = excl_full + '.__preserve_tmp__'
+                          tmp_holder = os.path.join(root, f'__preserve_tmp__.{excl}')
                           shutil.move(excl_full, tmp_holder)
                           carve_outs.append((excl_full, tmp_holder))
                           log(f"  preserving excluded subpackage untouched: {excl_full}")
@@ -273,11 +277,27 @@ jobs:
 
           def is_local_continuation(cont):
               """cont is whatever follows old_namespace in a match, e.g.
-              '.util.Logger', '.util.*', or '' for a bare match. Returns True
-              if this continuation corresponds to something that actually
-              exists in the moved local source tree (safe to rename), False
-              if it looks like a reference to an external dependency
-              (leave untouched)."""
+              '.util.Logger.e', '.data.repository.PreferenceRepositoryImpl.Keys',
+              '.util.*', or '' for a bare match. Returns True if this
+              continuation corresponds to something that actually exists in
+              the moved local source tree (safe to rename), False if it
+              looks like a reference to an external dependency (leave
+              untouched).
+
+              Real code frequently has MORE than one segment beyond the
+              actual package - a class name, a class name plus a member
+              (BuildConfig.APPLICATION_ID), or a class plus a nested
+              object plus a member (PreferenceRepositoryImpl.Keys via a
+              member import). So this checks every possible split point,
+              not just "one trailing segment", and accepts the longest
+              prefix that matches a real local package folder.
+
+              The one thing this must never do is let that broader search
+              accidentally re-admit a deliberately EXCLUDED subpackage
+              (e.g. '.extension.api.Logger.isDebug') just because checking
+              enough prefixes eventually reaches the always-present root
+              entry - so excluded subpackages are checked and rejected
+              FIRST, unconditionally, before the prefix search runs."""
               if cont == '':
                   return True
               parts = [p for p in cont.lstrip('.').split('.') if p]
@@ -285,10 +305,11 @@ jobs:
                   parts = parts[:-1]
               if not parts:
                   return True
-              if '.'.join(parts) in local_packages:
-                  return True  # whole continuation is itself a local package (wildcard import case)
-              if '.'.join(parts[:-1]) in local_packages:
-                  return True  # continuation minus its last segment (a class/symbol name) is local
+              if parts[0] in EXCLUDED_SUBPACKAGES:
+                  return False
+              for i in range(len(parts), -1, -1):
+                  if '.'.join(parts[:i]) in local_packages:
+                      return True
               return False
 
           # ---------------------------------------------------------------
@@ -492,6 +513,58 @@ jobs:
           else:
               log("ERROR: could not find app/build.gradle or app/build.gradle.kts")
               sys.exit(1)
+
+          # ---------------------------------------------------------------
+          # STEP E2: force-set 'namespace' in EVERY OTHER module's
+          # build.gradle(.kts) too, not just app's.
+          #
+          # AGP generates each module's OWN BuildConfig/R class under THAT
+          # module's own 'namespace' property - it is NOT shared across
+          # modules. In a multi-module project (e.g. separate :core, :util,
+          # :data modules matching the app's own internal package layout),
+          # if a submodule's 'namespace' is left at the OLD value while its
+          # SOURCE FILES get correctly renamed (Step C is folder-location
+          # based and works regardless of module boundaries), that module's
+          # generated BuildConfig ends up at the OLD namespace while the
+          # renamed source expects it at the NEW one - producing exactly
+          # "Unresolved reference 'BuildConfig'" (or the enclosing package
+          # segment, if resolution fails one level up). Step D's general
+          # text pass *should* already catch most of these via
+          # is_local_continuation, but this dedicated pass guarantees every
+          # module's own namespace is fixed unconditionally, closing any
+          # gap regardless of exact phrasing in that module's build file.
+          # ---------------------------------------------------------------
+          if old_namespace and old_namespace != NEW_PACKAGE:
+              other_gradle_files = [
+                  fp for fp in
+                  glob.glob(os.path.join(REPO, '**/build.gradle.kts'), recursive=True) +
+                  glob.glob(os.path.join(REPO, '**/build.gradle'), recursive=True)
+                  if fp != app_gradle and 'build' + os.sep not in os.path.relpath(fp, REPO).split(os.sep)[:-1]
+              ]
+              module_ns_fixed = 0
+              for fp in other_gradle_files:
+                  try:
+                      content = open(fp, encoding='utf-8').read()
+                  except Exception:
+                      continue
+                  m = re.search(r'namespace\s*=?\s*"([\w.]+)"', content)
+                  if not m:
+                      continue  # not an Android module (no namespace property) - skip
+                  current_ns = m.group(1)
+                  if not old_ns_pattern.search(current_ns):
+                      continue  # already doesn't reference the old namespace
+                  new_ns = old_ns_pattern.sub(NEW_PACKAGE, current_ns)
+                  is_kts = fp.endswith('.kts')
+                  new_content = re.sub(
+                      r'namespace\s*=?\s*"[\w.]+"',
+                      f'namespace = "{new_ns}"' if is_kts else f'namespace "{new_ns}"',
+                      content, count=1
+                  )
+                  open(fp, 'w', encoding='utf-8').write(new_content)
+                  log(f"  fixed submodule namespace: {fp}: '{current_ns}' -> '{new_ns}'")
+                  module_ns_fixed += 1
+              log(f"Fixed namespace in {module_ns_fixed} additional module build file(s) "
+                  f"(so each module's own BuildConfig/R class generates under its correct new package).")
 
           # ---------------------------------------------------------------
           # STEP F: AndroidManifest.xml - package attr, INTERNET permission,
