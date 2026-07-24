@@ -8,9 +8,9 @@ on:
 env:
   NEW_PACKAGE: com.nexus.appforge
   NEW_APP_NAME: "AppForge Manager"
-  ADMOB_APP_ID: "ca-app-pub-2804137706627200~6481242898"
-  ADMOB_BANNER_ID: "ca-app-pub-2804137706627200/8125497050"
-  ADMOB_INTERSTITIAL_ID: "ca-app-pub-2804137706627200/4152638624"
+  ADMOB_APP_ID: "ca-app-pub-2804137706627200~7134345988"
+  ADMOB_BANNER_ID: "ca-app-pub-2804137706627200/2193724503"
+  ADMOB_REWARDED_ID: "ca-app-pub-2804137706627200/7026534770"
   # Subpackages under the OLD namespace that must be left completely untouched
   # (not moved, not text-replaced, not flagged as "leftover"). Comma-separated,
   # relative to the old namespace root - e.g. "extension" means
@@ -64,7 +64,7 @@ jobs:
           NEW_APP_NAME = os.environ["NEW_APP_NAME"]
           ADMOB_APP_ID = os.environ["ADMOB_APP_ID"]
           BANNER_ID = os.environ["ADMOB_BANNER_ID"]
-          INTERSTITIAL_ID = os.environ["ADMOB_INTERSTITIAL_ID"]
+          REWARDED_ID = os.environ["ADMOB_REWARDED_ID"]
           ADS_VERSION = "23.6.0"
           SKIP_DIRS = {'.git', 'build', '.gradle', '.idea', 'node_modules'}
           EXCLUDED_SUBPACKAGES = [
@@ -569,17 +569,35 @@ jobs:
           # ---------------------------------------------------------------
           # STEP F: AndroidManifest.xml - package attr, INTERNET permission,
           # AdMob App ID meta-data.
+          #
+          # Manifest selection is deliberately NOT "first AndroidManifest.xml
+          # under any src/main/ found by walking the whole repo" - a project
+          # with multiple modules/flavors can have several such files, and
+          # picking the wrong one means the real app manifest silently never
+          # gets the AdMob meta-data (exactly the bug that shipped a crashing
+          # APK). Instead we derive the expected path directly from app_gradle
+          # (already reliably identified above), and only fall back to a
+          # repo-wide search if that exact expected file doesn't exist.
           # ---------------------------------------------------------------
+          app_module_dir = os.path.dirname(app_gradle)
+          expected_manifest = os.path.join(app_module_dir, 'src', 'main', 'AndroidManifest.xml')
+
           manifest = None
-          for r, dirs, files in walk(REPO):
-              if 'AndroidManifest.xml' in files and os.path.join('src', 'main') in r:
-                  manifest = os.path.join(r, 'AndroidManifest.xml')
-                  break
-          if not manifest:
+          if os.path.isfile(expected_manifest):
+              manifest = expected_manifest
+              log(f"Using app module's own manifest: {manifest}")
+          else:
+              log(f"WARNING: expected manifest not found at {expected_manifest}, "
+                  f"falling back to a repo-wide search.")
               for r, dirs, files in walk(REPO):
-                  if 'AndroidManifest.xml' in files:
+                  if 'AndroidManifest.xml' in files and os.path.join('src', 'main') in r:
                       manifest = os.path.join(r, 'AndroidManifest.xml')
                       break
+              if not manifest:
+                  for r, dirs, files in walk(REPO):
+                      if 'AndroidManifest.xml' in files:
+                          manifest = os.path.join(r, 'AndroidManifest.xml')
+                          break
 
           if manifest:
               content = open(manifest, encoding='utf-8').read()
@@ -599,32 +617,80 @@ jobs:
                       '            android:name="com.google.android.gms.ads.APPLICATION_ID"\n'
                       f'            android:value="{ADMOB_APP_ID}" />\n'
                   )
-                  content = re.sub(r'(\s*</application>)', '\n' + meta + r'\1', content, count=1)
+                  new_content, n = re.subn(r'(\s*</application>)', '\n' + meta + r'\1', content, count=1)
+                  if n:
+                      content = new_content
+                  else:
+                      log(f"ERROR: could not find </application> in {manifest} to insert "
+                          f"the AdMob meta-data - manifest may be malformed.")
+                      sys.exit(1)
+              else:
+                  # Meta-data tag already present (e.g. re-run) - make sure its VALUE is
+                  # actually our App ID, not a stale one left over from something else.
+                  content = re.sub(
+                      r'(android:name="com\.google\.android\.gms\.ads\.APPLICATION_ID"\s*\n?\s*android:value=")[^"]*(")',
+                      r'\g<1>' + ADMOB_APP_ID + r'\g<2>',
+                      content
+                  )
+
+              label_m = re.search(r'android:label="([^"]*)"', content)
+              if label_m and label_m.group(1) != '@string/app_name':
+                  log(f"  NOTE: <application> android:label is \"{label_m.group(1)}\", "
+                      f"not @string/app_name - app_name in strings.xml may not be what's "
+                      f"actually displayed. Not force-changing this automatically.")
 
               open(manifest, 'w', encoding='utf-8').write(content)
               log(f"Updated manifest: {manifest}")
+
+              # Hard verification - never let a manifest missing the AdMob App ID ship silently.
+              verify_content = open(manifest, encoding='utf-8').read()
+              if 'com.google.android.gms.ads.APPLICATION_ID' not in verify_content or ADMOB_APP_ID not in verify_content:
+                  log(f"ERROR: post-write verification failed - {manifest} does not contain "
+                      f"the AdMob APPLICATION_ID meta-data with the correct value. Aborting "
+                      f"rather than shipping an APK that will crash on ad init.")
+                  sys.exit(1)
+              log(f"  verified: AdMob APPLICATION_ID meta-data present with correct value.")
           else:
               log("ERROR: no AndroidManifest.xml found")
               sys.exit(1)
 
           # ---------------------------------------------------------------
           # STEP G: strings.xml app_name
+          #
+          # Real string resources very often carry extra attributes
+          # (translatable="false", tools:*, in either attribute order) -
+          # <string name="app_name"> as a literal match fails on any of
+          # those. Match name="app_name" as ONE of possibly several
+          # attributes instead, keeping whatever else was on the tag.
           # ---------------------------------------------------------------
+          APP_NAME_PATTERN = re.compile(
+              r'<string\b([^>]*\bname="app_name"[^>]*)>(.*?)</string>',
+              re.DOTALL
+          )
           strings_updated = 0
+          strings_files_with_key = []
           for r, dirs, files in walk(REPO):
               for f in files:
                   if f == 'strings.xml':
                       fp = os.path.join(r, f)
                       text = open(fp, encoding='utf-8').read()
-                      new_text, n = re.subn(
-                          r'(<string name="app_name">)(.*?)(</string>)',
-                          lambda m: m.group(1) + NEW_APP_NAME + m.group(3),
+                      new_text, n = APP_NAME_PATTERN.subn(
+                          lambda m: f'<string{m.group(1)}>{NEW_APP_NAME}</string>',
                           text
                       )
                       if n:
                           open(fp, 'w', encoding='utf-8').write(new_text)
                           strings_updated += 1
-          log(f"Updated app_name in {strings_updated} strings.xml file(s).")
+                          strings_files_with_key.append(fp)
+          log(f"Updated app_name in {strings_updated} strings.xml file(s):")
+          for fp in strings_files_with_key:
+              log(f"    {fp}")
+
+          if strings_updated == 0:
+              log("ERROR: no strings.xml file contained a name=\"app_name\" entry - "
+                  "the app name was NOT changed anywhere. Aborting rather than shipping "
+                  "an APK still showing the old name.")
+              sys.exit(1)
 
           # ---------------------------------------------------------------
           # STEP H: inject AdMob into HomeActivity.kt (now at its NEW path)
@@ -652,8 +718,8 @@ jobs:
               "import com.google.android.gms.ads.AdView",
               "import com.google.android.gms.ads.MobileAds",
               "import com.google.android.gms.ads.LoadAdError",
-              "import com.google.android.gms.ads.interstitial.InterstitialAd",
-              "import com.google.android.gms.ads.interstitial.InterstitialAdLoadCallback",
+              "import com.google.android.gms.ads.rewarded.RewardedAd",
+              "import com.google.android.gms.ads.rewarded.RewardedAdLoadCallback",
               "import android.view.ViewGroup",
           ]
           missing = [i for i in imports_needed if i not in content]
@@ -678,17 +744,17 @@ jobs:
               )
               appForgeAdView.loadAd(AdRequest.Builder().build())
 
-              var appForgeInterstitialAd: InterstitialAd? = null
-              InterstitialAd.load(
+              var appForgeRewardedAd: RewardedAd? = null
+              RewardedAd.load(
                   this,
-                  "{INTERSTITIAL_ID}",
+                  "{REWARDED_ID}",
                   AdRequest.Builder().build(),
-                  object : InterstitialAdLoadCallback() {{
-                      override fun onAdLoaded(ad: InterstitialAd) {{
-                          appForgeInterstitialAd = ad
+                  object : RewardedAdLoadCallback() {{
+                      override fun onAdLoaded(ad: RewardedAd) {{
+                          appForgeRewardedAd = ad
                       }}
                       override fun onAdFailedToLoad(adError: LoadAdError) {{
-                          appForgeInterstitialAd = null
+                          appForgeRewardedAd = null
                       }}
                   }}
               )
